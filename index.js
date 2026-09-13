@@ -1,67 +1,66 @@
 const express = require("express");
-const Database = require("better-sqlite3");
 const crypto = require("crypto");
+const { Pool } = require("pg");
 
 const app = express();
+
 app.use(express.json());
 
 // =====================================================
-// DATABASE
+// POSTGRES DATABASE
 // =====================================================
 
-const db = new Database("licenses.db");
-
-db.prepare(`
-    CREATE TABLE IF NOT EXISTS licenses (
-        license_key TEXT PRIMARY KEY,
-        discord_id TEXT,
-        discord_username TEXT,
-        hwid TEXT,
-        active INTEGER DEFAULT 1,
-        created_at INTEGER,
-        expires_at INTEGER
-    )
-`).run();
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl:
+        process.env.NODE_ENV === "production"
+            ? { rejectUnauthorized: false }
+            : false
+});
 
 // =====================================================
-// DATABASE MIGRATION
-// Maakt ook een oudere licenses.db compatibel
+// DATABASE SETUP
 // =====================================================
 
-function getColumns() {
-    return db
-        .prepare("PRAGMA table_info(licenses)")
-        .all()
-        .map(column => column.name);
+async function setupDatabase() {
+
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS licenses (
+            license_key TEXT PRIMARY KEY,
+
+            discord_id TEXT UNIQUE NOT NULL,
+            discord_username TEXT,
+
+            hwid TEXT,
+
+            active BOOLEAN NOT NULL DEFAULT TRUE,
+
+            created_at BIGINT NOT NULL,
+
+            expires_at BIGINT,
+
+            hwid_reset_count INTEGER NOT NULL DEFAULT 0,
+
+            last_hwid_reset_at BIGINT
+        )
+    `);
+
+    console.log("[DATABASE] License table ready.");
 }
-
-function addColumnIfMissing(name, type) {
-    const columns = getColumns();
-
-    if (!columns.includes(name)) {
-        db.prepare(
-            `ALTER TABLE licenses ADD COLUMN ${name} ${type}`
-        ).run();
-
-        console.log(`[DB] Added column: ${name}`);
-    }
-}
-
-addColumnIfMissing("discord_id", "TEXT");
-addColumnIfMissing("discord_username", "TEXT");
-addColumnIfMissing("created_at", "INTEGER");
-addColumnIfMissing("expires_at", "INTEGER");
 
 // =====================================================
 // ADMIN SECURITY
 // =====================================================
 
 function requireAdmin(req, res, next) {
-    const secret = req.headers["x-admin-secret"];
+
+    const secret =
+        req.headers["x-admin-secret"];
 
     if (!process.env.LICENSE_ADMIN_SECRET) {
+
         console.error(
-            "[SECURITY] LICENSE_ADMIN_SECRET is not configured!"
+            "[SECURITY] LICENSE_ADMIN_SECRET is missing!"
         );
 
         return res.status(500).json({
@@ -70,7 +69,11 @@ function requireAdmin(req, res, next) {
         });
     }
 
-    if (secret !== process.env.LICENSE_ADMIN_SECRET) {
+    if (
+        !secret ||
+        secret !== process.env.LICENSE_ADMIN_SECRET
+    ) {
+
         return res.status(403).json({
             success: false,
             error: "unauthorized"
@@ -85,7 +88,9 @@ function requireAdmin(req, res, next) {
 // =====================================================
 
 function generateLicense() {
+
     function part() {
+
         return crypto
             .randomBytes(2)
             .toString("hex")
@@ -96,6 +101,7 @@ function generateLicense() {
 }
 
 function isExpired(row) {
+
     if (!row.expires_at) {
         return false;
     }
@@ -104,11 +110,12 @@ function isExpired(row) {
 }
 
 function getLicenseStatus(row) {
+
     if (!row) {
         return "not_found";
     }
 
-    if (row.active !== 1) {
+    if (!row.active) {
         return "disabled";
     }
 
@@ -123,19 +130,40 @@ function getLicenseStatus(row) {
     return "unused";
 }
 
-function getLatestLicenseForDiscord(discordId) {
-    return db.prepare(`
-        SELECT *
-        FROM licenses
-        WHERE discord_id = ?
-        ORDER BY
-            CASE
-                WHEN created_at IS NULL THEN 0
-                ELSE created_at
-            END DESC,
-            rowid DESC
-        LIMIT 1
-    `).get(String(discordId));
+async function getLicenseByDiscord(discordId) {
+
+    const result =
+        await pool.query(
+            `
+            SELECT *
+            FROM licenses
+            WHERE discord_id = $1
+            LIMIT 1
+            `,
+            [
+                String(discordId)
+            ]
+        );
+
+    return result.rows[0] || null;
+}
+
+async function getLicenseByKey(licenseKey) {
+
+    const result =
+        await pool.query(
+            `
+            SELECT *
+            FROM licenses
+            WHERE license_key = $1
+            LIMIT 1
+            `,
+            [
+                String(licenseKey)
+            ]
+        );
+
+    return result.rows[0] || null;
 }
 
 // =====================================================
@@ -143,394 +171,689 @@ function getLatestLicenseForDiscord(discordId) {
 // =====================================================
 
 app.get("/", (req, res) => {
+
     res.json({
         success: true,
         service: "DonutFalse License API",
         status: "online",
-        version: "2.0"
+        database: "postgres",
+        version: "3.0"
     });
 });
 
 // =====================================================
 // CREATE LICENSE
-// Used by Discord bot
+//
+// Eén Discord account = één license.
+//
+// Als de user al een license heeft:
+// -> GEEN nieuwe key
+// -> bestaande key blijft behouden
 // =====================================================
 
-app.post("/create-key", requireAdmin, (req, res) => {
-    try {
-        const {
-            discord_id,
-            discord_username
-        } = req.body;
+app.post(
+    "/create-key",
+    requireAdmin,
+    async (req, res) => {
 
-        if (!discord_id) {
-            return res.status(400).json({
-                success: false,
-                error: "missing_discord_id"
-            });
-        }
+        try {
 
-        const existing =
-            getLatestLicenseForDiscord(discord_id);
-
-        // Don't create another usable license for same customer
-        if (
-            existing &&
-            existing.active === 1 &&
-            !isExpired(existing)
-        ) {
-            return res.status(409).json({
-                success: false,
-                error: "user_already_has_license",
-                license: existing.license_key
-            });
-        }
-
-        let licenseKey;
-
-        do {
-            licenseKey = generateLicense();
-        } while (
-            db.prepare(`
-                SELECT license_key
-                FROM licenses
-                WHERE license_key = ?
-            `).get(licenseKey)
-        );
-
-        const now = Date.now();
-
-        db.prepare(`
-            INSERT INTO licenses (
-                license_key,
+            const {
                 discord_id,
-                discord_username,
-                hwid,
-                active,
-                created_at,
-                expires_at
-            )
-            VALUES (?, ?, ?, NULL, 1, ?, NULL)
-        `).run(
-            licenseKey,
-            String(discord_id),
-            discord_username
-                ? String(discord_username)
-                : null,
-            now
-        );
+                discord_username
+            } = req.body;
 
-        console.log(
-            `[LICENSE] Generated ${licenseKey} for ${discord_username || discord_id}`
-        );
+            if (!discord_id) {
 
-        return res.json({
-            success: true,
-            license: licenseKey,
-            discord_id: String(discord_id),
-            discord_username:
-                discord_username || null,
-            status: "unused",
-            created_at: now,
-            expires_at: null,
-            duration: "infinite"
-        });
+                return res.status(400).json({
+                    success: false,
+                    error: "missing_discord_id"
+                });
+            }
 
-    } catch (error) {
-        console.error("[CREATE KEY ERROR]", error);
+            const existing =
+                await getLicenseByDiscord(
+                    discord_id
+                );
 
-        return res.status(500).json({
-            success: false,
-            error: "internal_server_error"
-        });
-    }
-});
+            // =========================================
+            // USER HEEFT AL EEN LICENSE
+            // =========================================
 
-// =====================================================
-// VERIFY LICENSE
-// Used by Minecraft mod
-// =====================================================
+            if (existing) {
 
-app.post("/verify", (req, res) => {
-    try {
-        const {
-            license,
-            hwid
-        } = req.body;
+                // Username eventueel updaten
+                if (
+                    discord_username &&
+                    discord_username !==
+                    existing.discord_username
+                ) {
 
-        if (!license || !hwid) {
-            return res.json({
-                valid: false,
-                reason: "missing_data"
-            });
-        }
+                    await pool.query(
+                        `
+                        UPDATE licenses
+                        SET discord_username = $1
+                        WHERE discord_id = $2
+                        `,
+                        [
+                            String(discord_username),
+                            String(discord_id)
+                        ]
+                    );
+                }
 
-        const cleanLicense =
-            String(license).trim();
+                return res.json({
+                    success: true,
+                    existing: true,
 
-        const cleanHwid =
-            String(hwid).trim();
+                    license:
+                        existing.license_key,
 
-        const row = db.prepare(`
-            SELECT *
-            FROM licenses
-            WHERE license_key = ?
-        `).get(cleanLicense);
+                    discord_id:
+                        existing.discord_id,
 
-        if (!row) {
-            return res.json({
-                valid: false,
-                reason: "invalid_license"
-            });
-        }
+                    discord_username:
+                        discord_username ||
+                        existing.discord_username,
 
-        // Disabled
-        if (row.active !== 1) {
-            return res.json({
-                valid: false,
-                reason: "disabled"
-            });
-        }
+                    active:
+                        existing.active,
 
-        // Expired
-        if (isExpired(row)) {
-            return res.json({
-                valid: false,
-                reason: "expired",
-                expires_at: row.expires_at
-            });
-        }
+                    hwid:
+                        existing.hwid,
 
-        // First activation:
-        // bind this license to this PC
-        if (!row.hwid) {
-            db.prepare(`
-                UPDATE licenses
-                SET hwid = ?
-                WHERE license_key = ?
-            `).run(
-                cleanHwid,
-                cleanLicense
+                    status:
+                        getLicenseStatus(existing),
+
+                    created_at:
+                        Number(existing.created_at),
+
+                    expires_at:
+                        existing.expires_at
+                            ? Number(existing.expires_at)
+                            : null
+                });
+            }
+
+            // =========================================
+            // NIEUWE LICENSE
+            // =========================================
+
+            let licenseKey;
+
+            while (true) {
+
+                licenseKey =
+                    generateLicense();
+
+                const found =
+                    await getLicenseByKey(
+                        licenseKey
+                    );
+
+                if (!found) {
+                    break;
+                }
+            }
+
+            const now =
+                Date.now();
+
+            await pool.query(
+                `
+                INSERT INTO licenses (
+                    license_key,
+                    discord_id,
+                    discord_username,
+                    hwid,
+                    active,
+                    created_at,
+                    expires_at,
+                    hwid_reset_count,
+                    last_hwid_reset_at
+                )
+                VALUES (
+                    $1,
+                    $2,
+                    $3,
+                    NULL,
+                    TRUE,
+                    $4,
+                    NULL,
+                    0,
+                    NULL
+                )
+                `,
+                [
+                    licenseKey,
+                    String(discord_id),
+                    discord_username
+                        ? String(discord_username)
+                        : null,
+                    now
+                ]
             );
 
             console.log(
-                `[LICENSE] First activation: ${cleanLicense}`
+                `[LICENSE] Generated ${licenseKey} for ${discord_username || discord_id}`
             );
 
             return res.json({
-                valid: true,
-                reason: "first_activation",
-                expires_at: row.expires_at
+                success: true,
+                existing: false,
+
+                license:
+                    licenseKey,
+
+                discord_id:
+                    String(discord_id),
+
+                discord_username:
+                    discord_username || null,
+
+                active:
+                    true,
+
+                hwid:
+                    null,
+
+                status:
+                    "unused",
+
+                created_at:
+                    now,
+
+                expires_at:
+                    null,
+
+                duration:
+                    "infinite"
+            });
+
+        } catch (error) {
+
+            console.error(
+                "[CREATE KEY ERROR]",
+                error
+            );
+
+            return res.status(500).json({
+                success: false,
+                error: "internal_server_error"
             });
         }
-
-        // Same PC
-        if (row.hwid === cleanHwid) {
-            return res.json({
-                valid: true,
-                reason: "valid",
-                expires_at: row.expires_at
-            });
-        }
-
-        // Different PC
-        return res.json({
-            valid: false,
-            reason: "hwid_mismatch"
-        });
-
-    } catch (error) {
-        console.error("[VERIFY ERROR]", error);
-
-        return res.status(500).json({
-            valid: false,
-            reason: "server_error"
-        });
     }
-});
+);
+
+// =====================================================
+// VERIFY LICENSE
+//
+// Minecraft gebruikt deze route.
+//
+// Eerste activatie:
+// HWID wordt gekoppeld.
+//
+// Zelfde PC:
+// toegestaan.
+//
+// Andere PC:
+// geweigerd.
+//
+// Na /license-reset:
+// nieuwe PC kan gekoppeld worden.
+// =====================================================
+
+app.post(
+    "/verify",
+    async (req, res) => {
+
+        try {
+
+            const {
+                license,
+                hwid
+            } = req.body;
+
+            if (!license || !hwid) {
+
+                return res.json({
+                    valid: false,
+                    reason: "missing_data"
+                });
+            }
+
+            const cleanLicense =
+                String(license).trim();
+
+            const cleanHwid =
+                String(hwid).trim();
+
+            const row =
+                await getLicenseByKey(
+                    cleanLicense
+                );
+
+            // =========================================
+            // KEY BESTAAT NIET
+            // =========================================
+
+            if (!row) {
+
+                return res.json({
+                    valid: false,
+                    reason: "invalid_license"
+                });
+            }
+
+            // =========================================
+            // DISABLED
+            // =========================================
+
+            if (!row.active) {
+
+                return res.json({
+                    valid: false,
+                    reason: "disabled"
+                });
+            }
+
+            // =========================================
+            // EXPIRED
+            // =========================================
+
+            if (isExpired(row)) {
+
+                return res.json({
+                    valid: false,
+                    reason: "expired",
+
+                    expires_at:
+                        Number(row.expires_at)
+                });
+            }
+
+            // =========================================
+            // EERSTE ACTIVATIE / NA HWID RESET
+            // =========================================
+
+            if (!row.hwid) {
+
+                await pool.query(
+                    `
+                    UPDATE licenses
+                    SET hwid = $1
+                    WHERE license_key = $2
+                    `,
+                    [
+                        cleanHwid,
+                        cleanLicense
+                    ]
+                );
+
+                console.log(
+                    `[LICENSE] ${cleanLicense} linked to HWID`
+                );
+
+                return res.json({
+                    valid: true,
+
+                    reason:
+                        "first_activation",
+
+                    expires_at:
+                        row.expires_at
+                            ? Number(row.expires_at)
+                            : null
+                });
+            }
+
+            // =========================================
+            // ZELFDE HWID
+            // =========================================
+
+            if (
+                row.hwid === cleanHwid
+            ) {
+
+                return res.json({
+                    valid: true,
+
+                    reason:
+                        "valid",
+
+                    expires_at:
+                        row.expires_at
+                            ? Number(row.expires_at)
+                            : null
+                });
+            }
+
+            // =========================================
+            // ANDERE PC
+            // =========================================
+
+            return res.json({
+                valid: false,
+                reason: "hwid_mismatch"
+            });
+
+        } catch (error) {
+
+            console.error(
+                "[VERIFY ERROR]",
+                error
+            );
+
+            return res.status(500).json({
+                valid: false,
+                reason: "server_error"
+            });
+        }
+    }
+);
 
 // =====================================================
 // LICENSE INFO
-// GET /license-info?discord_id=...
+//
+// Blijft license ALTIJD tonen:
+// - unused
+// - activated
+// - expired
+// - disabled
+//
+// Alleen als er echt nooit een license bestond:
+// found = false
 // =====================================================
 
-app.get("/license-info", requireAdmin, (req, res) => {
-    try {
-        const discordId =
-            req.query.discord_id;
+app.get(
+    "/license-info",
+    requireAdmin,
+    async (req, res) => {
 
-        if (!discordId) {
-            return res.status(400).json({
-                success: false,
-                error: "missing_discord_id"
-            });
-        }
+        try {
 
-        const row =
-            getLatestLicenseForDiscord(discordId);
+            const discordId =
+                req.query.discord_id;
 
-        if (!row) {
+            if (!discordId) {
+
+                return res.status(400).json({
+                    success: false,
+                    error: "missing_discord_id"
+                });
+            }
+
+            const row =
+                await getLicenseByDiscord(
+                    discordId
+                );
+
+            if (!row) {
+
+                return res.json({
+                    success: true,
+                    found: false
+                });
+            }
+
             return res.json({
                 success: true,
-                found: false
+                found: true,
+
+                license:
+                    row.license_key,
+
+                discord_id:
+                    row.discord_id,
+
+                discord_username:
+                    row.discord_username,
+
+                hwid:
+                    row.hwid,
+
+                active:
+                    row.active,
+
+                status:
+                    getLicenseStatus(row),
+
+                created_at:
+                    Number(row.created_at),
+
+                expires_at:
+                    row.expires_at
+                        ? Number(row.expires_at)
+                        : null,
+
+                duration:
+                    row.expires_at
+                        ? "temporary"
+                        : "infinite",
+
+                hwid_reset_count:
+                    row.hwid_reset_count,
+
+                last_hwid_reset_at:
+                    row.last_hwid_reset_at
+                        ? Number(row.last_hwid_reset_at)
+                        : null
             });
-        }
 
-        return res.json({
-            success: true,
-            found: true,
+        } catch (error) {
 
-            license:
-                row.license_key,
+            console.error(
+                "[LICENSE INFO ERROR]",
+                error
+            );
 
-            discord_id:
-                row.discord_id,
-
-            discord_username:
-                row.discord_username,
-
-            hwid:
-                row.hwid,
-
-            active:
-                row.active === 1,
-
-            status:
-                getLicenseStatus(row),
-
-            created_at:
-                row.created_at,
-
-            expires_at:
-                row.expires_at,
-
-            duration:
-                row.expires_at
-                    ? "temporary"
-                    : "infinite"
-        });
-
-    } catch (error) {
-        console.error("[LICENSE INFO ERROR]", error);
-
-        return res.status(500).json({
-            success: false,
-            error: "internal_server_error"
-        });
-    }
-});
-
-// =====================================================
-// DISABLE LICENSE
-// =====================================================
-
-app.post("/license-disable", requireAdmin, (req, res) => {
-    try {
-        const {
-            discord_id
-        } = req.body;
-
-        if (!discord_id) {
-            return res.status(400).json({
+            return res.status(500).json({
                 success: false,
-                error: "missing_discord_id"
+                error: "internal_server_error"
             });
         }
-
-        const row =
-            getLatestLicenseForDiscord(discord_id);
-
-        if (!row) {
-            return res.status(404).json({
-                success: false,
-                error: "license_not_found"
-            });
-        }
-
-        db.prepare(`
-            UPDATE licenses
-            SET active = 0
-            WHERE license_key = ?
-        `).run(row.license_key);
-
-        console.log(
-            `[LICENSE] Disabled ${row.license_key}`
-        );
-
-        return res.json({
-            success: true,
-            license: row.license_key,
-            status: "disabled"
-        });
-
-    } catch (error) {
-        console.error("[DISABLE ERROR]", error);
-
-        return res.status(500).json({
-            success: false,
-            error: "internal_server_error"
-        });
     }
-});
+);
 
 // =====================================================
 // RESET HWID
-// Allows same license to bind to another PC
+//
+// Kan ONBEPERKT gebruikt worden.
+//
+// Verwijdert NIET:
+// - license
+// - Discord ID
+// - username
+// - timer
+// - active status
+//
+// Alleen HWID wordt leeg.
 // =====================================================
 
-app.post("/license-reset", requireAdmin, (req, res) => {
-    try {
-        const {
-            discord_id
-        } = req.body;
+app.post(
+    "/license-reset",
+    requireAdmin,
+    async (req, res) => {
 
-        if (!discord_id) {
-            return res.status(400).json({
+        try {
+
+            const {
+                discord_id
+            } = req.body;
+
+            if (!discord_id) {
+
+                return res.status(400).json({
+                    success: false,
+                    error: "missing_discord_id"
+                });
+            }
+
+            const row =
+                await getLicenseByDiscord(
+                    discord_id
+                );
+
+            if (!row) {
+
+                return res.status(404).json({
+                    success: false,
+                    error: "license_not_found"
+                });
+            }
+
+            const now =
+                Date.now();
+
+            const result =
+                await pool.query(
+                    `
+                    UPDATE licenses
+                    SET
+                        hwid = NULL,
+                        hwid_reset_count =
+                            hwid_reset_count + 1,
+                        last_hwid_reset_at = $1
+                    WHERE discord_id = $2
+                    RETURNING *
+                    `,
+                    [
+                        now,
+                        String(discord_id)
+                    ]
+                );
+
+            const updated =
+                result.rows[0];
+
+            console.log(
+                `[LICENSE] HWID reset #${updated.hwid_reset_count} for ${updated.license_key}`
+            );
+
+            return res.json({
+                success: true,
+
+                license:
+                    updated.license_key,
+
+                hwid_reset:
+                    true,
+
+                hwid_reset_count:
+                    updated.hwid_reset_count,
+
+                last_hwid_reset_at:
+                    now
+            });
+
+        } catch (error) {
+
+            console.error(
+                "[RESET ERROR]",
+                error
+            );
+
+            return res.status(500).json({
                 success: false,
-                error: "missing_discord_id"
+                error: "internal_server_error"
             });
         }
-
-        const row =
-            getLatestLicenseForDiscord(discord_id);
-
-        if (!row) {
-            return res.status(404).json({
-                success: false,
-                error: "license_not_found"
-            });
-        }
-
-        db.prepare(`
-            UPDATE licenses
-            SET hwid = NULL
-            WHERE license_key = ?
-        `).run(row.license_key);
-
-        console.log(
-            `[LICENSE] HWID reset for ${row.license_key}`
-        );
-
-        return res.json({
-            success: true,
-            license: row.license_key,
-            hwid_reset: true
-        });
-
-    } catch (error) {
-        console.error("[RESET ERROR]", error);
-
-        return res.status(500).json({
-            success: false,
-            error: "internal_server_error"
-        });
     }
-});
+);
+
+// =====================================================
+// DISABLE LICENSE
+//
+// License wordt NIET verwijderd.
+//
+// Alleen:
+// active = false
+//
+// Daardoor blijft /license-info hem tonen.
+// =====================================================
+
+app.post(
+    "/license-disable",
+    requireAdmin,
+    async (req, res) => {
+
+        try {
+
+            const {
+                discord_id
+            } = req.body;
+
+            if (!discord_id) {
+
+                return res.status(400).json({
+                    success: false,
+                    error: "missing_discord_id"
+                });
+            }
+
+            const row =
+                await getLicenseByDiscord(
+                    discord_id
+                );
+
+            if (!row) {
+
+                return res.status(404).json({
+                    success: false,
+                    error: "license_not_found"
+                });
+            }
+
+            const result =
+                await pool.query(
+                    `
+                    UPDATE licenses
+                    SET active = FALSE
+                    WHERE discord_id = $1
+                    RETURNING *
+                    `,
+                    [
+                        String(discord_id)
+                    ]
+                );
+
+            const updated =
+                result.rows[0];
+
+            console.log(
+                `[LICENSE] Disabled ${updated.license_key}`
+            );
+
+            return res.json({
+                success: true,
+
+                license:
+                    updated.license_key,
+
+                status:
+                    "disabled"
+            });
+
+        } catch (error) {
+
+            console.error(
+                "[DISABLE ERROR]",
+                error
+            );
+
+            return res.status(500).json({
+                success: false,
+                error: "internal_server_error"
+            });
+        }
+    }
+);
 
 // =====================================================
 // LICENSE TIMER
 //
-// Supported:
+// Voorbeelden:
+// 3d
 // 7d
 // 30d
 // 90d
@@ -538,221 +861,320 @@ app.post("/license-reset", requireAdmin, (req, res) => {
 // infinite
 // permanent
 // lifetime
+//
+// BELANGRIJK:
+// Timer verandert ACTIVE NIET.
+//
+// Dus een disabled key blijft disabled.
 // =====================================================
 
-app.post("/license-timer", requireAdmin, (req, res) => {
-    try {
-        const {
-            discord_id,
-            duration
-        } = req.body;
+app.post(
+    "/license-timer",
+    requireAdmin,
+    async (req, res) => {
 
-        if (!discord_id || !duration) {
-            return res.status(400).json({
-                success: false,
-                error: "missing_data"
-            });
-        }
+        try {
 
-        const row =
-            getLatestLicenseForDiscord(discord_id);
+            const {
+                discord_id,
+                duration
+            } = req.body;
 
-        if (!row) {
-            return res.status(404).json({
-                success: false,
-                error: "license_not_found"
-            });
-        }
+            if (
+                !discord_id ||
+                !duration
+            ) {
 
-        const normalized =
-            String(duration)
-                .trim()
-                .toLowerCase();
+                return res.status(400).json({
+                    success: false,
+                    error: "missing_data"
+                });
+            }
 
-        // =========================
-        // PERMANENT
-        // =========================
+            const row =
+                await getLicenseByDiscord(
+                    discord_id
+                );
 
-        if (
-            normalized === "infinite" ||
-            normalized === "permanent" ||
-            normalized === "lifetime"
-        ) {
-            db.prepare(`
-                UPDATE licenses
-                SET
-                    expires_at = NULL,
-                    active = 1
-                WHERE license_key = ?
-            `).run(row.license_key);
+            if (!row) {
+
+                return res.status(404).json({
+                    success: false,
+                    error: "license_not_found"
+                });
+            }
+
+            const normalized =
+                String(duration)
+                    .trim()
+                    .toLowerCase();
+
+            // =========================================
+            // PERMANENT
+            // =========================================
+
+            if (
+                normalized === "infinite" ||
+                normalized === "permanent" ||
+                normalized === "lifetime"
+            ) {
+
+                const result =
+                    await pool.query(
+                        `
+                        UPDATE licenses
+                        SET expires_at = NULL
+                        WHERE discord_id = $1
+                        RETURNING *
+                        `,
+                        [
+                            String(discord_id)
+                        ]
+                    );
+
+                const updated =
+                    result.rows[0];
+
+                console.log(
+                    `[LICENSE] ${updated.license_key} -> infinite`
+                );
+
+                return res.json({
+                    success: true,
+
+                    license:
+                        updated.license_key,
+
+                    duration:
+                        "infinite",
+
+                    expires_at:
+                        null
+                });
+            }
+
+            // =========================================
+            // X DAYS
+            // =========================================
+
+            const match =
+                normalized.match(
+                    /^([1-9][0-9]{0,3})d$/
+                );
+
+            if (!match) {
+
+                return res.status(400).json({
+                    success: false,
+
+                    error:
+                        "invalid_duration",
+
+                    examples: [
+                        "3d",
+                        "7d",
+                        "30d",
+                        "90d",
+                        "365d",
+                        "infinite"
+                    ]
+                });
+            }
+
+            const days =
+                Number(match[1]);
+
+            const expiresAt =
+                Date.now() +
+                (
+                    days *
+                    24 *
+                    60 *
+                    60 *
+                    1000
+                );
+
+            const result =
+                await pool.query(
+                    `
+                    UPDATE licenses
+                    SET expires_at = $1
+                    WHERE discord_id = $2
+                    RETURNING *
+                    `,
+                    [
+                        expiresAt,
+                        String(discord_id)
+                    ]
+                );
+
+            const updated =
+                result.rows[0];
 
             console.log(
-                `[LICENSE] ${row.license_key} -> permanent`
+                `[LICENSE] ${updated.license_key} -> ${days}d`
             );
 
             return res.json({
                 success: true,
-                license: row.license_key,
-                duration: "infinite",
-                expires_at: null
+
+                license:
+                    updated.license_key,
+
+                duration:
+                    `${days}d`,
+
+                days:
+                    days,
+
+                expires_at:
+                    expiresAt
             });
-        }
 
-        // =========================
-        // X DAYS
-        // Example: 30d
-        // =========================
+        } catch (error) {
 
-        const match =
-            normalized.match(
-                /^([1-9][0-9]{0,3})d$/
+            console.error(
+                "[TIMER ERROR]",
+                error
             );
 
-        if (!match) {
-            return res.status(400).json({
+            return res.status(500).json({
                 success: false,
-                error: "invalid_duration",
-                examples: [
-                    "7d",
-                    "30d",
-                    "90d",
-                    "365d",
-                    "infinite"
-                ]
+                error: "internal_server_error"
             });
         }
+    }
+);
 
-        const days =
-            Number(match[1]);
+// =====================================================
+// LICENSE STOCK
+// =====================================================
 
-        const expiresAt =
-            Date.now() +
-            (
-                days *
-                24 *
-                60 *
-                60 *
-                1000
+app.get(
+    "/license-stock",
+    requireAdmin,
+    async (req, res) => {
+
+        try {
+
+            const result =
+                await pool.query(`
+                    SELECT *
+                    FROM licenses
+                `);
+
+            const rows =
+                result.rows;
+
+            let unused = 0;
+            let activated = 0;
+            let disabled = 0;
+            let expired = 0;
+
+            for (const row of rows) {
+
+                const status =
+                    getLicenseStatus(row);
+
+                switch (status) {
+
+                    case "unused":
+                        unused++;
+                        break;
+
+                    case "activated":
+                        activated++;
+                        break;
+
+                    case "disabled":
+                        disabled++;
+                        break;
+
+                    case "expired":
+                        expired++;
+                        break;
+                }
+            }
+
+            return res.json({
+                success: true,
+
+                total:
+                    rows.length,
+
+                unused,
+
+                activated,
+
+                disabled,
+
+                expired
+            });
+
+        } catch (error) {
+
+            console.error(
+                "[STOCK ERROR]",
+                error
             );
 
-        db.prepare(`
-            UPDATE licenses
-            SET
-                expires_at = ?,
-                active = 1
-            WHERE license_key = ?
-        `).run(
-            expiresAt,
-            row.license_key
-        );
-
-        console.log(
-            `[LICENSE] ${row.license_key} -> ${days}d`
-        );
-
-        return res.json({
-            success: true,
-            license: row.license_key,
-            duration: `${days}d`,
-            days: days,
-            expires_at: expiresAt
-        });
-
-    } catch (error) {
-        console.error("[TIMER ERROR]", error);
-
-        return res.status(500).json({
-            success: false,
-            error: "internal_server_error"
-        });
-    }
-});
-
-// =====================================================
-// LICENSE STOCK / STATISTICS
-// =====================================================
-
-app.get("/license-stock", requireAdmin, (req, res) => {
-    try {
-        const rows =
-            db.prepare(`
-                SELECT *
-                FROM licenses
-            `).all();
-
-        let unused = 0;
-        let activated = 0;
-        let disabled = 0;
-        let expired = 0;
-
-        for (const row of rows) {
-            const status =
-                getLicenseStatus(row);
-
-            switch (status) {
-                case "unused":
-                    unused++;
-                    break;
-
-                case "activated":
-                    activated++;
-                    break;
-
-                case "disabled":
-                    disabled++;
-                    break;
-
-                case "expired":
-                    expired++;
-                    break;
-            }
+            return res.status(500).json({
+                success: false,
+                error: "internal_server_error"
+            });
         }
+    }
+);
 
-        return res.json({
-            success: true,
-            total: rows.length,
-            unused: unused,
-            activated: activated,
-            disabled: disabled,
-            expired: expired
-        });
+// =====================================================
+// 404
+// =====================================================
 
-    } catch (error) {
-        console.error("[STOCK ERROR]", error);
+app.use(
+    (req, res) => {
 
-        return res.status(500).json({
+        return res.status(404).json({
             success: false,
-            error: "internal_server_error"
+            error: "route_not_found",
+            method: req.method,
+            path: req.path
         });
     }
-});
+);
 
 // =====================================================
-// 404 - JSON instead of ugly HTML
-// =====================================================
-
-app.use((req, res) => {
-    return res.status(404).json({
-        success: false,
-        error: "route_not_found",
-        method: req.method,
-        path: req.path
-    });
-});
-
-// =====================================================
-// SERVER
+// START SERVER
 // =====================================================
 
 const PORT =
     process.env.PORT || 3000;
 
-app.listen(
-    PORT,
-    "0.0.0.0",
-    () => {
-        console.log(
-            `DonutFalse License API online on port ${PORT}`
+async function start() {
+
+    try {
+
+        await setupDatabase();
+
+        app.listen(
+            PORT,
+            "0.0.0.0",
+            () => {
+
+                console.log(
+                    `DonutFalse License API online on port ${PORT}`
+                );
+            }
         );
+
+    } catch (error) {
+
+        console.error(
+            "[STARTUP ERROR]",
+            error
+        );
+
+        process.exit(1);
     }
-);
+}
+
+start();
