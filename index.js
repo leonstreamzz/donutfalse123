@@ -28,7 +28,7 @@ async function setupDatabase() {
         CREATE TABLE IF NOT EXISTS licenses (
             license_key TEXT PRIMARY KEY,
 
-            discord_id TEXT UNIQUE NOT NULL,
+            discord_id TEXT NOT NULL,
             discord_username TEXT,
 
             hwid TEXT,
@@ -45,7 +45,36 @@ async function setupDatabase() {
         )
     `);
 
-    console.log("[DATABASE] License table ready.");
+    // =================================================
+    // MIGRATION
+    //
+    // Oude versie had:
+    // discord_id TEXT UNIQUE
+    //
+    // Dat voorkomt meerdere keys voor dezelfde Discord-user.
+    // Deze constraint verwijderen we.
+    // =================================================
+
+    await pool.query(`
+        ALTER TABLE licenses
+        DROP CONSTRAINT IF EXISTS licenses_discord_id_key
+    `);
+
+    // Sneller zoeken op Discord ID
+    await pool.query(`
+        CREATE INDEX IF NOT EXISTS idx_licenses_discord_id
+        ON licenses(discord_id)
+    `);
+
+    // Sneller latest license vinden
+    await pool.query(`
+        CREATE INDEX IF NOT EXISTS idx_licenses_discord_created
+        ON licenses(discord_id, created_at DESC)
+    `);
+
+    console.log(
+        "[DATABASE] License table ready."
+    );
 }
 
 // =====================================================
@@ -130,7 +159,11 @@ function getLicenseStatus(row) {
     return "unused";
 }
 
-async function getLicenseByDiscord(discordId) {
+// =====================================================
+// GET NEWEST LICENSE FOR DISCORD USER
+// =====================================================
+
+async function getLatestLicenseByDiscord(discordId) {
 
     const result =
         await pool.query(
@@ -138,6 +171,7 @@ async function getLicenseByDiscord(discordId) {
             SELECT *
             FROM licenses
             WHERE discord_id = $1
+            ORDER BY created_at DESC
             LIMIT 1
             `,
             [
@@ -147,6 +181,10 @@ async function getLicenseByDiscord(discordId) {
 
     return result.rows[0] || null;
 }
+
+// =====================================================
+// GET LICENSE BY KEY
+// =====================================================
 
 async function getLicenseByKey(licenseKey) {
 
@@ -177,24 +215,32 @@ app.get("/", (req, res) => {
         service: "DonutFalse License API",
         status: "online",
         database: "postgres",
-        version: "3.0"
+        version: "4.0"
     });
 });
 
 // =====================================================
-// CREATE LICENSE
+// CREATE / REGENERATE LICENSE
 //
-// Eén Discord account = één license.
+// ELKE keer /license-generate:
+// -> nieuwe license
 //
-// Als de user al een license heeft:
-// -> GEEN nieuwe key
-// -> bestaande key blijft behouden
+// Oude licenses:
+// -> blijven in database
+// -> worden disabled
+//
+// Nieuwe:
+// -> active
+// -> nieuwe HWID binding
 // =====================================================
 
 app.post(
     "/create-key",
     requireAdmin,
     async (req, res) => {
+
+        const client =
+            await pool.connect();
 
         try {
 
@@ -211,72 +257,36 @@ app.post(
                 });
             }
 
-            const existing =
-                await getLicenseByDiscord(
-                    discord_id
+            const discordId =
+                String(discord_id);
+
+            const username =
+                discord_username
+                    ? String(discord_username)
+                    : null;
+
+            await client.query("BEGIN");
+
+            // =========================================
+            // OUDE LICENSES UITZETTEN
+            // =========================================
+
+            const previous =
+                await client.query(
+                    `
+                    UPDATE licenses
+                    SET active = FALSE
+                    WHERE discord_id = $1
+                    AND active = TRUE
+                    RETURNING license_key
+                    `,
+                    [
+                        discordId
+                    ]
                 );
 
             // =========================================
-            // USER HEEFT AL EEN LICENSE
-            // =========================================
-
-            if (existing) {
-
-                // Username eventueel updaten
-                if (
-                    discord_username &&
-                    discord_username !==
-                    existing.discord_username
-                ) {
-
-                    await pool.query(
-                        `
-                        UPDATE licenses
-                        SET discord_username = $1
-                        WHERE discord_id = $2
-                        `,
-                        [
-                            String(discord_username),
-                            String(discord_id)
-                        ]
-                    );
-                }
-
-                return res.json({
-                    success: true,
-                    existing: true,
-
-                    license:
-                        existing.license_key,
-
-                    discord_id:
-                        existing.discord_id,
-
-                    discord_username:
-                        discord_username ||
-                        existing.discord_username,
-
-                    active:
-                        existing.active,
-
-                    hwid:
-                        existing.hwid,
-
-                    status:
-                        getLicenseStatus(existing),
-
-                    created_at:
-                        Number(existing.created_at),
-
-                    expires_at:
-                        existing.expires_at
-                            ? Number(existing.expires_at)
-                            : null
-                });
-            }
-
-            // =========================================
-            // NIEUWE LICENSE
+            // NIEUWE UNIEKE KEY
             // =========================================
 
             let licenseKey;
@@ -286,12 +296,22 @@ app.post(
                 licenseKey =
                     generateLicense();
 
-                const found =
-                    await getLicenseByKey(
-                        licenseKey
+                const check =
+                    await client.query(
+                        `
+                        SELECT license_key
+                        FROM licenses
+                        WHERE license_key = $1
+                        LIMIT 1
+                        `,
+                        [
+                            licenseKey
+                        ]
                     );
 
-                if (!found) {
+                if (
+                    check.rows.length === 0
+                ) {
                     break;
                 }
             }
@@ -299,7 +319,11 @@ app.post(
             const now =
                 Date.now();
 
-            await pool.query(
+            // =========================================
+            // NIEUWE LICENSE OPSLAAN
+            // =========================================
+
+            await client.query(
                 `
                 INSERT INTO licenses (
                     license_key,
@@ -326,30 +350,31 @@ app.post(
                 `,
                 [
                     licenseKey,
-                    String(discord_id),
-                    discord_username
-                        ? String(discord_username)
-                        : null,
+                    discordId,
+                    username,
                     now
                 ]
             );
 
+            await client.query(
+                "COMMIT"
+            );
+
             console.log(
-                `[LICENSE] Generated ${licenseKey} for ${discord_username || discord_id}`
+                `[LICENSE] Generated new license ${licenseKey} for ${username || discordId}`
             );
 
             return res.json({
                 success: true,
-                existing: false,
 
                 license:
                     licenseKey,
 
                 discord_id:
-                    String(discord_id),
+                    discordId,
 
                 discord_username:
-                    discord_username || null,
+                    username,
 
                 active:
                     true,
@@ -367,10 +392,19 @@ app.post(
                     null,
 
                 duration:
-                    "infinite"
+                    "infinite",
+
+                previous_licenses_disabled:
+                    previous.rowCount
             });
 
         } catch (error) {
+
+            try {
+                await client.query(
+                    "ROLLBACK"
+                );
+            } catch {}
 
             console.error(
                 "[CREATE KEY ERROR]",
@@ -381,6 +415,10 @@ app.post(
                 success: false,
                 error: "internal_server_error"
             });
+
+        } finally {
+
+            client.release();
         }
     }
 );
@@ -388,19 +426,14 @@ app.post(
 // =====================================================
 // VERIFY LICENSE
 //
-// Minecraft gebruikt deze route.
+// Minecraft gebruikt deze.
 //
-// Eerste activatie:
-// HWID wordt gekoppeld.
+// Oude generated keys:
+// active = false
+// -> disabled
 //
-// Zelfde PC:
-// toegestaan.
-//
-// Andere PC:
-// geweigerd.
-//
-// Na /license-reset:
-// nieuwe PC kan gekoppeld worden.
+// Nieuwe key:
+// eerste PC -> HWID bind
 // =====================================================
 
 app.post(
@@ -414,7 +447,10 @@ app.post(
                 hwid
             } = req.body;
 
-            if (!license || !hwid) {
+            if (
+                !license ||
+                !hwid
+            ) {
 
                 return res.json({
                     valid: false,
@@ -468,12 +504,14 @@ app.post(
                     reason: "expired",
 
                     expires_at:
-                        Number(row.expires_at)
+                        Number(
+                            row.expires_at
+                        )
                 });
             }
 
             // =========================================
-            // EERSTE ACTIVATIE / NA HWID RESET
+            // FIRST ACTIVATION / RESET
             // =========================================
 
             if (!row.hwid) {
@@ -502,13 +540,15 @@ app.post(
 
                     expires_at:
                         row.expires_at
-                            ? Number(row.expires_at)
+                            ? Number(
+                                row.expires_at
+                            )
                             : null
                 });
             }
 
             // =========================================
-            // ZELFDE HWID
+            // SAME PC
             // =========================================
 
             if (
@@ -523,13 +563,15 @@ app.post(
 
                     expires_at:
                         row.expires_at
-                            ? Number(row.expires_at)
+                            ? Number(
+                                row.expires_at
+                            )
                             : null
                 });
             }
 
             // =========================================
-            // ANDERE PC
+            // DIFFERENT PC
             // =========================================
 
             return res.json({
@@ -555,14 +597,7 @@ app.post(
 // =====================================================
 // LICENSE INFO
 //
-// Blijft license ALTIJD tonen:
-// - unused
-// - activated
-// - expired
-// - disabled
-//
-// Alleen als er echt nooit een license bestond:
-// found = false
+// Altijd NIEUWSTE license voor Discord-user.
 // =====================================================
 
 app.get(
@@ -584,7 +619,7 @@ app.get(
             }
 
             const row =
-                await getLicenseByDiscord(
+                await getLatestLicenseByDiscord(
                     discordId
                 );
 
@@ -619,11 +654,15 @@ app.get(
                     getLicenseStatus(row),
 
                 created_at:
-                    Number(row.created_at),
+                    Number(
+                        row.created_at
+                    ),
 
                 expires_at:
                     row.expires_at
-                        ? Number(row.expires_at)
+                        ? Number(
+                            row.expires_at
+                        )
                         : null,
 
                 duration:
@@ -636,7 +675,9 @@ app.get(
 
                 last_hwid_reset_at:
                     row.last_hwid_reset_at
-                        ? Number(row.last_hwid_reset_at)
+                        ? Number(
+                            row.last_hwid_reset_at
+                        )
                         : null
             });
 
@@ -658,16 +699,13 @@ app.get(
 // =====================================================
 // RESET HWID
 //
-// Kan ONBEPERKT gebruikt worden.
+// Onbeperkt.
 //
-// Verwijdert NIET:
-// - license
-// - Discord ID
-// - username
-// - timer
-// - active status
+// Alleen nieuwste license.
 //
-// Alleen HWID wordt leeg.
+// Key blijft bestaan.
+// Discord ID blijft bestaan.
+// Timer blijft bestaan.
 // =====================================================
 
 app.post(
@@ -690,7 +728,7 @@ app.post(
             }
 
             const row =
-                await getLicenseByDiscord(
+                await getLatestLicenseByDiscord(
                     discord_id
                 );
 
@@ -711,15 +749,19 @@ app.post(
                     UPDATE licenses
                     SET
                         hwid = NULL,
+
                         hwid_reset_count =
                             hwid_reset_count + 1,
+
                         last_hwid_reset_at = $1
-                    WHERE discord_id = $2
+
+                    WHERE license_key = $2
+
                     RETURNING *
                     `,
                     [
                         now,
-                        String(discord_id)
+                        row.license_key
                     ]
                 );
 
@@ -764,12 +806,11 @@ app.post(
 // =====================================================
 // DISABLE LICENSE
 //
-// License wordt NIET verwijderd.
+// Alleen nieuwste license wordt disabled.
 //
-// Alleen:
-// active = false
+// Wordt NIET verwijderd.
 //
-// Daardoor blijft /license-info hem tonen.
+// /license-info blijft hem tonen.
 // =====================================================
 
 app.post(
@@ -792,7 +833,7 @@ app.post(
             }
 
             const row =
-                await getLicenseByDiscord(
+                await getLatestLicenseByDiscord(
                     discord_id
                 );
 
@@ -809,11 +850,11 @@ app.post(
                     `
                     UPDATE licenses
                     SET active = FALSE
-                    WHERE discord_id = $1
+                    WHERE license_key = $1
                     RETURNING *
                     `,
                     [
-                        String(discord_id)
+                        row.license_key
                     ]
                 );
 
@@ -852,20 +893,17 @@ app.post(
 // =====================================================
 // LICENSE TIMER
 //
-// Voorbeelden:
+// Ondersteund:
+// 1d
 // 3d
 // 7d
 // 30d
 // 90d
 // 365d
+//
 // infinite
 // permanent
 // lifetime
-//
-// BELANGRIJK:
-// Timer verandert ACTIVE NIET.
-//
-// Dus een disabled key blijft disabled.
 // =====================================================
 
 app.post(
@@ -892,7 +930,7 @@ app.post(
             }
 
             const row =
-                await getLicenseByDiscord(
+                await getLatestLicenseByDiscord(
                     discord_id
                 );
 
@@ -924,11 +962,11 @@ app.post(
                         `
                         UPDATE licenses
                         SET expires_at = NULL
-                        WHERE discord_id = $1
+                        WHERE license_key = $1
                         RETURNING *
                         `,
                         [
-                            String(discord_id)
+                            row.license_key
                         ]
                     );
 
@@ -954,7 +992,11 @@ app.post(
             }
 
             // =========================================
-            // X DAYS
+            // NUMBER + d
+            //
+            // 3d works
+            // 30d works
+            // etc.
             // =========================================
 
             const match =
@@ -971,6 +1013,7 @@ app.post(
                         "invalid_duration",
 
                     examples: [
+                        "1d",
                         "3d",
                         "7d",
                         "30d",
@@ -999,12 +1042,12 @@ app.post(
                     `
                     UPDATE licenses
                     SET expires_at = $1
-                    WHERE discord_id = $2
+                    WHERE license_key = $2
                     RETURNING *
                     `,
                     [
                         expiresAt,
-                        String(discord_id)
+                        row.license_key
                     ]
                 );
 
@@ -1048,6 +1091,10 @@ app.post(
 
 // =====================================================
 // LICENSE STOCK
+//
+// Alle oude licenses blijven bestaan.
+//
+// Oude regenerated keys tellen als Disabled.
 // =====================================================
 
 app.get(
@@ -1143,7 +1190,7 @@ app.use(
 );
 
 // =====================================================
-// START SERVER
+// START
 // =====================================================
 
 const PORT =
